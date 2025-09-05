@@ -1,0 +1,129 @@
+name: Build images
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:         ${{ steps.mk.outputs.matrix }}
+      default_branch: ${{ steps.ctx.outputs.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: ctx
+        run: echo "default_branch=${{ github.event.repository.default_branch || 'main' }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: mk
+        run: |
+          python .github/scripts/discover_images.py > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: ${{ needs.discover.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if hidden
+        if: ${{ matrix.hidden }}
+        run: echo "Hidden image; skipping."
+
+      - name: Pick comparison base 
+        id: base
+        if: ${{ !matrix.hidden }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          BASE_LINE="$(bash .github/scripts/pick_base.sh)"
+          echo "$BASE_LINE"
+          echo "$BASE_LINE" >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes
+        id: change
+        if: ${{ !matrix.hidden }}
+        run: |
+          changed=$(bash .github/scripts/changed.sh "${{ matrix.rebuild_policy }}" "${{ matrix.dir }}" "${{ steps.base.outputs.base }}")
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no changes
+        if: ${{ steps.change.outputs.changed == 'false' }}
+        run: echo "No changes in ${{ matrix.dir }}."
+
+      - uses: docker/setup-buildx-action@v3
+        if: ${{ steps.change.outputs.changed == 'true' }}
+
+      # PRs: build only, no push
+      - name: Build (PR) — validate only
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name == 'pull_request' }}
+        run: |
+          docker buildx build --load --platform linux/amd64 \
+            -f "${{ matrix.dir }}/Dockerfile" "${{ matrix.dir }}"
+
+      # Push builds on branch pushes / manual
+      - uses: docker/login-action@v3
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name != 'pull_request' }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push (edge or branch tag + sha)
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name != 'pull_request' }}
+        run: |
+          set -euo pipefail
+          dir="${{ matrix.dir }}"
+          name="${{ matrix.name }}"
+          img="${IMAGE_PREFIX}/${name}"
+          sha_tag="sha-$(git rev-parse --short=7 HEAD)"
+          plats="${{ matrix.platforms }}"
+          default_branch='${{ needs.discover.outputs.default_branch }}'
+
+          # decide secondary lifecycle tag: edge (default branch) or branch name (others)
+          branch="${{ github.ref_name }}"
+          branch_safe="$(echo "$branch" | tr '/ ' '--' )"
+          if [ "$branch" = "$default_branch" ]; then
+            lifecycle_tag="edge"
+          else
+            lifecycle_tag="$branch_safe"
+          fi
+
+          echo "::group::Building ${img}:${sha_tag} and :${lifecycle_tag} (platforms=$plats)"
+          docker buildx build \
+            --push \
+            --platform "$plats" \
+            -f "$dir/Dockerfile" \
+            -t "${img}:${sha_tag}" \
+            -t "${img}:${lifecycle_tag}" \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
+            "$dir"
+          echo
