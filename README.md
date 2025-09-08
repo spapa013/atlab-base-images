@@ -33,7 +33,7 @@ Packages live under `ghcr.io/<owner>/<repo>/…`.
 - **Default branch** (e.g., `main`):  
   `ghcr.io/<owner>/<repo>/<image_name>`
 - **Other branches**:  
-  `ghcr.io/<owner>/<repo>/<image_name>-br-<sanitized-branch>`
+  `ghcr.io/<owner>/<repo>/<image_name>-br-<sanitized-branch-name>`
 
 > Branches get their **own package namespace**. This means a branch can safely publish its own tags (including `latest`) without affecting the default branch package.
 
@@ -71,7 +71,7 @@ Place a `build.json` alongside the Dockerfile to override defaults for that imag
 
 ## Workflow behavior
 
-We use two workflows: an **orchestrator** (`build-images.yml`) that discovers images and fans out a matrix, and a **reusable** workflow (`_build-image.yml`) that performs the per-image steps.
+We use two workflows: an **orchestrator** (`build-images.yml`) that discovers images and fans out a matrix for building in parallel, and a **reusable** workflow (`_build-image.yml`) that performs the per-image steps.
 
 ### Triggers
 
@@ -128,8 +128,8 @@ On pull requests, we **build only** (no registry push). By default we validate f
   - `ghcr.io/<owner>/<repo>/myapp-base:edge`  
   - If `version` changed: `:vX.Y.Z` and `:latest`
 - **Other branches**: the image is published under a **branch-scoped package**, e.g.:  
-  - `ghcr.io/<owner>/<repo>/myapp-base-br-feature-foo:sha-<shortSHA>`  
-  - `ghcr.io/<owner>/<repo>/myapp-base-br-feature-foo:edge`  
+  - `ghcr.io/<owner>/<repo>/myapp-base-br-dev:sha-<shortSHA>`  
+  - `ghcr.io/<owner>/<repo>/myapp-base-br-dev:edge`  
   - If `version` changed: `:vX.Y.Z` and `:latest` (scoped to that branch package)
 
 ---
@@ -152,12 +152,32 @@ The reusable workflow calls small scripts in `.github/scripts/`:
 ## FAQ
 
 - **What does `hidden: true` do?**  
+
   It **skips building** that image in CI. It does **not** delete or hide a package already on GHCR.
 
 - **Why branch-scoped packages?**  
+
   To avoid tag collisions and confusion. A branch can publish its own `:edge`, `:latest`, and `:vX.Y.Z` without affecting the default branch’s package.
 
 - **Do we need a separate release workflow?**  
+
   No. Versioning is **per image** via `build.json: "version"`. When you bump it, CI publishes `:<version>` and rolls `:latest` for that package automatically.
 
+- **How do I add images that depend on other images in this repo?**
+
+  Automatic *sequential* or *simultaneous* building of dependent images is **not supported** by this workflow.  
+  Each image is treated independently.
+
+  If you want to build one image **based on another** in the same repo, you should:
+
+  1. **Pin the base image** in your dependent Dockerfile using a *stable tag* produced by CI:
+    - Prefer an immutable commit tag (`sha-<shortSHA>`)  
+    - Or a version tag (e.g., `v1.2.3`) if you’ve defined one in `build.json`.
+
+    Example:
+    ```dockerfile
+    FROM ghcr.io/<owner>/<repo>/python-base:sha-abc1234
+    ```
+
+  2. Push a new commit whenever you want to advance the dependency. This ensures the dependent image is rebuilt with the new base.
 ---
