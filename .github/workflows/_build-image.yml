@@ -1,0 +1,113 @@
+name: _build-image
+
+on:
+  workflow_call:
+    inputs:
+      dir:            { required: true, type: string }
+      name:           { required: true, type: string }
+      platforms:      { required: true, type: string }
+      rebuild_policy: { required: true, type: string }
+      hidden:         { required: true, type: boolean }
+      default_branch: { required: true, type: string }
+    secrets:
+      GITHUB_TOKEN: { required: true }
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build_one:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+      REGISTRY:     ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if hidden
+        if: ${{ inputs.hidden }}
+        run: echo "Hidden image; skipping."
+
+      - name: Pick comparison base
+        id: base
+        if: ${{ !inputs.hidden }}
+        env:
+          PR_BASE_SHA:       ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE:       ${{ github.event.before }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          .github/scripts/pick_base.sh >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes
+        id: change
+        if: ${{ !inputs.hidden }}
+        env:
+          POLICY:     ${{ inputs.rebuild_policy }}
+          MATRIX_DIR: ${{ inputs.dir }}
+          BASE_SHA:   ${{ steps.base.outputs.base }}
+        run: |
+          .github/scripts/check_for_changes.sh >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no changes
+        if: ${{ steps.change.outputs.changed == 'false' }}
+        run: echo "No changes in ${{ inputs.dir }}."
+
+      - uses: docker/setup-buildx-action@v3
+        if: ${{ steps.change.outputs.changed == 'true' }}
+
+      - name: Build (PR) — validate only
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name == 'pull_request' }}
+        env:
+          DIR:       ${{ inputs.dir }}
+        run: |
+          .github/scripts/build_for_pr.sh
+
+      - name: Derive image
+        id: img
+        if: ${{ steps.change.outputs.changed == 'true' }}
+        env:
+          DEFAULT_BRANCH:   ${{ inputs.default_branch }}
+          REF_NAME:         ${{ github.ref_name }}
+          IMAGE_PREFIX:     ${{ env.IMAGE_PREFIX }}
+          IMAGE_BASE_NAME:  ${{ inputs.name }}
+        run: |
+          .github/scripts/derive_image.sh >> "$GITHUB_OUTPUT"
+
+      - name: Detect version change
+        id: ver
+        if: ${{ steps.change.outputs.changed == 'true' }}
+        env:
+          MATRIX_DIR: ${{ inputs.dir }}
+          BASE_SHA:   ${{ steps.base.outputs.base }}
+        run: |
+          .github/scripts/detect_version.sh >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name != 'pull_request' }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Guard immutable version tag
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name != 'pull_request' && steps.ver.outputs.version_changed == 'true' }}
+        env:
+          IMAGE:           ${{ steps.img.outputs.image }}
+          CURR_VERSION:    ${{ steps.ver.outputs.curr_version }}
+          VERSION_CHANGED: ${{ steps.ver.outputs.version_changed }}
+        run: |
+          .github/scripts/guard_version.sh
+
+      - name: Build & push
+        if: ${{ steps.change.outputs.changed == 'true' && github.event_name != 'pull_request' }}
+        env:
+          DIR:             ${{ inputs.dir }}
+          IMAGE:           ${{ steps.img.outputs.image }}
+          PLATFORMS:       ${{ inputs.platforms }}
+          CURR_VERSION:    ${{ steps.ver.outputs.curr_version }}
+          VERSION_CHANGED: ${{ steps.ver.outputs.version_changed }}
+        run: |
+          .github/scripts/build_and_push.sh
