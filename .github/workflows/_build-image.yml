@@ -9,8 +9,6 @@ on:
       rebuild_policy: { required: true, type: string }
       hidden:         { required: true, type: boolean }
       default_branch: { required: true, type: string }
-    secrets:
-      GITHUB_TOKEN: { required: true }
 
 permissions:
   contents: read
